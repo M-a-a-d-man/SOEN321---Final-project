@@ -115,4 +115,62 @@ class CryptoUtils:
             return session_key
     class SymmetricEncryption:
         def __init__(self):
-                pass
+            pass
+
+        def generate_aes_key(self) -> bytes:
+            """Generate a random 256-bit AES key."""
+            return os.urandom(32)
+
+        def encrypt(self, key: bytes, plaintext: bytes) -> bytes:
+            """Encrypt plaintext using AES-256-GCM. Returns nonce + ciphertext+tag."""
+            nonce = os.urandom(12)
+            aesgcm = AESGCM(key)
+            ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+            return nonce + ciphertext
+
+        def decrypt(self, key: bytes, data: bytes) -> bytes:
+            """Decrypt AES-256-GCM data (nonce prepended). Returns plaintext."""
+            nonce = data[:12]
+            ciphertext = data[12:]
+            aesgcm = AESGCM(key)
+            return aesgcm.decrypt(nonce, ciphertext, None)
+
+    class Signing:
+        def __init__(self):
+            pass
+
+        def sign(self, private_key, message: bytes) -> bytes:
+            """Sign a message with RSA-PSS using SHA-256. Returns the signature."""
+            from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+            return private_key.sign(
+                message,
+                asym_padding.PSS(
+                    mgf=asym_padding.MGF1(hashes.SHA256()),
+                    salt_length=asym_padding.PSS.MAX_LENGTH,
+                ),
+                hashes.SHA256(),
+            )
+
+        def verify(self, public_key, message: bytes, signature: bytes) -> bool:
+            """Verify an RSA-PSS SHA-256 signature. Returns True if valid, False otherwise."""
+            from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
+            try:
+                public_key.verify(
+                    signature,
+                    message,
+                    asym_padding.PSS(
+                        mgf=asym_padding.MGF1(hashes.SHA256()),
+                        salt_length=asym_padding.PSS.MAX_LENGTH,
+                    ),
+                    hashes.SHA256(),
+                )
+                return True
+            except Exception:
+                return False
+
+        def hash_sha256(self, data: bytes) -> bytes:
+            """Return the SHA-256 digest of data."""
+            from cryptography.hazmat.backends import default_backend
+            digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
+            digest.update(data)
+            return digest.finalize()
