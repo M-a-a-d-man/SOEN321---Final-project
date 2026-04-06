@@ -76,7 +76,7 @@ class Header:
         )
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "Header":
+    def from_bytes(cls, data: bytes) -> Header:
         if len(data) < HEADER_SIZE:
             raise ValueError(
                 f"need {HEADER_SIZE} bytes for header, got {len(data)}"
@@ -119,7 +119,7 @@ class Message:
         recipient_id: bytes,
         payload: bytes,
         timestamp: int | None = None,
-    ) -> "Message":
+    ) -> Message:
         # default to now so callers don't have to think about it
         ts = timestamp if timestamp is not None else int(time.time() * 1000)
         header = Header(
@@ -135,7 +135,7 @@ class Message:
         return self.header.to_bytes() + self.payload
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "Message":
+    def from_bytes(cls, data: bytes) -> Message:
         header = Header.from_bytes(data)
         payload = data[HEADER_SIZE: HEADER_SIZE + header.payload_length]
         if len(payload) != header.payload_length:
@@ -178,7 +178,7 @@ class KeyExchangePayload:
         )
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "KeyExchangePayload":
+    def from_bytes(cls, data: bytes) -> KeyExchangePayload:
         pem, _ = _read_blob(data, 0)
         return cls(public_key_pem=pem)
 
@@ -202,7 +202,7 @@ class SessionInitPayload:
         )
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "SessionInitPayload":
+    def from_bytes(cls, data: bytes) -> SessionInitPayload:
         enc_key, _ = _read_blob(data, 0)
         return cls(encrypted_session_key=enc_key)
 
@@ -232,7 +232,7 @@ class ChatPayload:
         )
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "ChatPayload":
+    def from_bytes(cls, data: bytes) -> ChatPayload:
         ciphertext, offset = _read_blob(data, 0)
         signature, _ = _read_blob(data, offset)
         return cls(ciphertext=ciphertext, signature=signature)
@@ -254,7 +254,7 @@ class AckPayload:
         return struct.pack("!Q", self.acked_timestamp)
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "AckPayload":
+    def from_bytes(cls, data: bytes) -> AckPayload:
         if len(data) < 8:
             raise ValueError("AckPayload requires 8 bytes")
         ts, = struct.unpack("!Q", data[:8])
@@ -279,7 +279,7 @@ class ErrorPayload:
         return struct.pack("!HH", self.error_code, len(encoded)) + encoded
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "ErrorPayload":
+    def from_bytes(cls, data: bytes) -> ErrorPayload:
         if len(data) < 4:
             raise ValueError("ErrorPayload too short")
         error_code, msg_len = struct.unpack("!HH", data[:4])
@@ -305,7 +305,7 @@ class DisconnectPayload:
         return struct.pack("!H", len(encoded)) + encoded
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "DisconnectPayload":
+    def from_bytes(cls, data: bytes) -> DisconnectPayload:
         if len(data) < 2:
             return cls(reason="")
         reason_len, = struct.unpack("!H", data[:2])
