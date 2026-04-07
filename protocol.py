@@ -35,6 +35,9 @@ class MessageType(IntEnum):
     ACK = 0x04        # let the sender know the message arrived
     ERROR = 0x05
     DISCONNECT = 0x06
+    JOIN_CREATE = 0x07   # client wants to create a new room
+    JOIN_RESPONSE = 0x08  # server replies with the generated join code
+    JOIN_REQUEST = 0x09  # client wants to join an existing room by code
 
 
 @dataclass(frozen=True)
@@ -315,38 +318,64 @@ class DisconnectPayload:
         return cls(reason=reason_bytes.decode("utf-8"))
 
 
-AnyPayload = (
-    KeyExchangePayload
-    | SessionInitPayload
-    | ChatPayload
-    | AckPayload
-    | ErrorPayload
-    | DisconnectPayload
-)
+@dataclass(frozen=True)
+class JoinCreatePayload:
+    # no data needed — the server generates everything for the new room
+    def to_bytes(self) -> bytes:
+        return b""
 
-_PAYLOAD_REGISTRY: dict[MessageType, type] = {
-    MessageType.KEY_EXCHANGE: KeyExchangePayload,
-    MessageType.SESSION_INIT: SessionInitPayload,
-    MessageType.CHAT:         ChatPayload,
-    MessageType.ACK:          AckPayload,
-    MessageType.ERROR:        ErrorPayload,
-    MessageType.DISCONNECT:   DisconnectPayload,
-}
+    @classmethod
+    def from_bytes(cls, _: bytes) -> JoinCreatePayload:
+        return cls()
 
 
-def parse_payload(message_type: MessageType, payload: bytes) -> AnyPayload:
-    """Deserialize payload bytes into the right class for this message type."""
-    if not isinstance(message_type, MessageType):
-        raise TypeError(
-            f"message_type must be a MessageType, got {type(message_type)}"
-        )
-    if not isinstance(payload, (bytes, bytearray)):
-        raise TypeError(
-            f"payload must be bytes, got {type(payload)}"
-        )
+@dataclass(frozen=True)
+class JoinResponsePayload:
+    # server sends back the join code so the client can share it
+    join_code: str
 
-    payload_cls = _PAYLOAD_REGISTRY.get(message_type)
-    if payload_cls is None:
-        raise KeyError(f"unknown message type: {message_type!r}")
+    def __post_init__(self) -> None:
+        if not isinstance(self.join_code, str):
+            raise TypeError("join_code must be a str")
+        if not self.join_code:
+            raise ValueError("join_code is empty")
 
-    return payload_cls.from_bytes(payload)
+    def to_bytes(self) -> bytes:
+        encoded = self.join_code.encode("utf-8")
+        return struct.pack("!H", len(encoded)) + encoded
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> JoinResponsePayload:
+        if len(data) < 2:
+            raise ValueError("JoinResponsePayload too short")
+        code_len, = struct.unpack("!H", data[:2])
+        code_bytes = data[2: 2 + code_len]
+        if len(code_bytes) != code_len:
+            raise ValueError("truncated join_code")
+        return cls(join_code=code_bytes.decode("utf-8"))
+
+
+@dataclass(frozen=True)
+class JoinRequestPayload:
+    # client sends the code it received out-of-band to get into a room
+    join_code: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.join_code, str):
+            raise TypeError("join_code must be a str")
+        if not self.join_code:
+            raise ValueError("join_code is empty")
+
+    def to_bytes(self) -> bytes:
+        encoded = self.join_code.encode("utf-8")
+        return struct.pack("!H", len(encoded)) + encoded
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> JoinRequestPayload:
+        if len(data) < 2:
+            raise ValueError("JoinRequestPayload too short")
+        code_len, = struct.unpack("!H", data[:2])
+        code_bytes = data[2: 2 + code_len]
+        if len(code_bytes) != code_len:
+            raise ValueError("truncated join_code")
+        return cls(join_code=code_bytes.decode("utf-8"))
