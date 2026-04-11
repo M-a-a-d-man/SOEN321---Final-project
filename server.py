@@ -14,6 +14,7 @@ from protocol import (
     AckPayload,
     ErrorPayload,
     JoinResponsePayload,
+    JoinRequestPayload,
 )
 
 SERVER_ID = b'\x00' * 16
@@ -118,7 +119,7 @@ def handle_message(key: selectors.SelectorKey, message: Message):
 
     elif header.message_type == MessageType.JOIN_REQUEST:
         # client submits a join code to link with another user
-        code = message.payload.decode("utf-8")
+        code = JoinRequestPayload.from_bytes(message.payload).join_code
         target_id = join_codes.get(code)
         if target_id is None:
             send_error(sender_id, 4, "Invalid join code")
