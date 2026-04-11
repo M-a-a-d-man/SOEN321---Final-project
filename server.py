@@ -3,6 +3,7 @@ import selectors
 import types
 import secrets
 import string
+from hashlib import sha256
 
 from protocol import (
     HEADER_SIZE,
@@ -12,6 +13,7 @@ from protocol import (
     KeyExchangePayload,
     AckPayload,
     ErrorPayload,
+    JoinResponsePayload,
 )
 
 SERVER_ID = b'\x00' * 16
@@ -65,6 +67,12 @@ def handle_message(key: selectors.SelectorKey, message: Message):
         if recipient_id == SERVER_ID:
             # registration: store public key
             payload = KeyExchangePayload.from_bytes(message.payload)
+            # bind user_id to the public key so clients can't claim arbitrary
+            # identities: user_id must equal SHA-256(pem)[:16]
+            expected_id = sha256(payload.public_key_pem).digest()[:16]
+            if sender_id != expected_id:
+                send_error(sender_id, 5, "user_id does not match public key")
+                return
             public_keys[sender_id] = payload.public_key_pem
             connections[sender_id] = key
             print(f"Registered user {sender_id.hex()}")
@@ -104,7 +112,7 @@ def handle_message(key: selectors.SelectorKey, message: Message):
             message_type=MessageType.JOIN_RESPONSE,
             sender_id=SERVER_ID,
             recipient_id=sender_id,
-            payload=code.encode("utf-8"),
+            payload=JoinResponsePayload(join_code=code).to_bytes(),
         )
         send_to_client(sender_id, resp)
 

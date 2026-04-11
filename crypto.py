@@ -43,6 +43,7 @@ class CryptoUtils:
             )
             return plaintext.decode()
         
+        @staticmethod
         def save_private_key(private_key, filepath: str, passphrase: bytes = None) -> None:
             if passphrase is not None:
                 encryption = serialization.BestAvailableEncryption(passphrase)
@@ -57,7 +58,8 @@ class CryptoUtils:
 
             with open(filepath, "wb") as f:
                 f.write(pem_data)
-    
+
+        @staticmethod
         def load_private_key(filepath: str, passphrase: bytes = None):
             with open(filepath, "rb") as f:
                 pem_data = f.read()
@@ -67,7 +69,8 @@ class CryptoUtils:
                 password=passphrase
             )
             return private_key
-        
+
+        @staticmethod
         def save_public_key(public_key, filepath: str) -> None:
             pem_data = public_key.public_bytes(
                 encoding=serialization.Encoding.PEM,
@@ -75,23 +78,27 @@ class CryptoUtils:
             )
             with open(filepath, "wb") as f:
                 f.write(pem_data)
-        
+
+        @staticmethod
         def load_public_key(filepath: str):
             with open(filepath, "rb") as f:
                 pem_data = f.read()
 
-            serialization.load_pem_public_key(pem_data)
             public_key = serialization.load_pem_public_key(pem_data)
             return public_key
-        
+
+        @staticmethod
         def public_key_to_bytes(public_key) -> bytes:
             return public_key.public_bytes(
                 encoding=serialization.Encoding.PEM,
                 format=serialization.PublicFormat.SubjectPublicKeyInfo,
             )
+
+        @staticmethod
         def public_key_from_bytes(pem_bytes: bytes):
             return serialization.load_pem_public_key(pem_bytes)
-        
+
+        @staticmethod
         def rsa_encrypt_session_key(session_key: bytes, recipient_public_key) -> bytes:
             encrypted_key = recipient_public_key.encrypt(
                 session_key,
@@ -102,7 +109,8 @@ class CryptoUtils:
                 ),
             )
             return encrypted_key
-        
+
+        @staticmethod
         def rsa_decrypt_session_key(encrypted_key_bytes: bytes, private_key) -> bytes:
             session_key = private_key.decrypt(
                 encrypted_key_bytes,
