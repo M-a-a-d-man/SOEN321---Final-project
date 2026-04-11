@@ -3,8 +3,8 @@ import selectors
 import types
 import secrets
 import string
-from hashlib import sha256
 
+from crypto import CryptoUtils
 from protocol import (
     HEADER_SIZE,
     Header,
@@ -69,8 +69,10 @@ def handle_message(key: selectors.SelectorKey, message: Message):
             # registration: store public key
             payload = KeyExchangePayload.from_bytes(message.payload)
             # bind user_id to the public key so clients can't claim arbitrary
-            # identities: user_id must equal SHA-256(pem)[:16]
-            expected_id = sha256(payload.public_key_pem).digest()[:16]
+            # identities
+            expected_id = CryptoUtils.KeyExchange.user_id_from_pem(
+                payload.public_key_pem
+            )
             if sender_id != expected_id:
                 send_error(sender_id, 5, "user_id does not match public key")
                 return
