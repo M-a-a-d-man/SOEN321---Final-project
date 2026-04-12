@@ -1,10 +1,12 @@
+from __future__ import annotations
+
 import socket
 import selectors
 import types
 import secrets
 import string
-from hashlib import sha256
 
+from crypto import CryptoUtils
 from protocol import (
     HEADER_SIZE,
     Header,
@@ -14,6 +16,7 @@ from protocol import (
     AckPayload,
     ErrorPayload,
     JoinResponsePayload,
+    JoinRequestPayload,
 )
 
 SERVER_ID = b'\x00' * 16
@@ -43,7 +46,7 @@ def send_to_client(user_id: bytes, msg: Message):
     key.data.outb += msg.to_bytes()
 
 
-def send_error(sender_id: bytes, error_code: int, message: str):
+def send_error(sender_id: bytes, error_code: int, message: str, key: selectors.SelectorKey | None = None):
     payload = ErrorPayload(error_code=error_code, message=message)
     msg = Message.build(
         message_type=MessageType.ERROR,
@@ -51,7 +54,13 @@ def send_error(sender_id: bytes, error_code: int, message: str):
         recipient_id=sender_id,
         payload=payload.to_bytes(),
     )
-    send_to_client(sender_id, msg)
+    # if we have a direct key (e.g. the client isn't registered yet), write
+    # straight to its outbound buffer instead of routing through the
+    # connections dict which only has registered users
+    if key is not None:
+        key.data.outb += msg.to_bytes()
+    else:
+        send_to_client(sender_id, msg)
 
 
 def are_linked(user_a: bytes, user_b: bytes) -> bool:
@@ -68,10 +77,12 @@ def handle_message(key: selectors.SelectorKey, message: Message):
             # registration: store public key
             payload = KeyExchangePayload.from_bytes(message.payload)
             # bind user_id to the public key so clients can't claim arbitrary
-            # identities: user_id must equal SHA-256(pem)[:16]
-            expected_id = sha256(payload.public_key_pem).digest()[:16]
+            # identities
+            expected_id = CryptoUtils.KeyExchange.user_id_from_pem(
+                payload.public_key_pem
+            )
             if sender_id != expected_id:
-                send_error(sender_id, 5, "user_id does not match public key")
+                send_error(sender_id, 5, "user_id does not match public key", key=key)
                 return
             public_keys[sender_id] = payload.public_key_pem
             connections[sender_id] = key
@@ -118,7 +129,7 @@ def handle_message(key: selectors.SelectorKey, message: Message):
 
     elif header.message_type == MessageType.JOIN_REQUEST:
         # client submits a join code to link with another user
-        code = message.payload.decode("utf-8")
+        code = JoinRequestPayload.from_bytes(message.payload).join_code
         target_id = join_codes.get(code)
         if target_id is None:
             send_error(sender_id, 4, "Invalid join code")

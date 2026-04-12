@@ -1,6 +1,7 @@
 from fileinput import filename
 import os
 import base64
+from hashlib import sha256
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import hashes, serialization
@@ -97,6 +98,10 @@ class CryptoUtils:
         @staticmethod
         def public_key_from_bytes(pem_bytes: bytes):
             return serialization.load_pem_public_key(pem_bytes)
+
+        @staticmethod
+        def user_id_from_pem(pem_bytes: bytes) -> bytes:
+            return sha256(pem_bytes).digest()[:16]
 
         @staticmethod
         def rsa_encrypt_session_key(session_key: bytes, recipient_public_key) -> bytes:
