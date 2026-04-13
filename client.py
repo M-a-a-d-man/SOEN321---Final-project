@@ -21,6 +21,7 @@ from protocol import (
     MessageType,
     KeyExchangePayload,
     SessionInitPayload,
+    SessionAcceptPayload,
     ChatPayload,
     AckPayload,
     ErrorPayload,
@@ -39,6 +40,7 @@ MAX_PAYLOAD = 1 << 20  # 1 MiB — bound the receive buffer
 _kx = CryptoUtils.KeyExchange()
 _sym = CryptoUtils.SymmetricEncryption()
 _signer = CryptoUtils.Signing()
+_ecdh = CryptoUtils.EphemeralKeyExchange
 
 
 class ClientState:
@@ -53,6 +55,14 @@ class ClientState:
         self.session_key: bytes | None = None
         self.join_code: str | None = None
 
+        # Ephemeral X25519 private key held by the joiner between sending
+        # SESSION_INIT and receiving SESSION_ACCEPT.
+        self.ephemeral_priv = None
+        # Raw SESSION_INIT payload stored by the handler so create_room()
+        # can verify and complete the ECDH handshake after fetching the
+        # joiner's long-term public key from the server.
+        self.pending_session_init: SessionInitPayload | None = None
+
         # single Condition guards all handshake signalling and the error
         # slot, so that a late ERROR can't silently pre-set events for
         # later phases
@@ -61,9 +71,18 @@ class ClientState:
         self.got_join_code = False
         self.got_peer_pubkey = False
         self.got_session_init = False
+        self.got_session_accept = False
         self.error: str | None = None
 
         self.running = True
+
+        # Outbound sequence number (incremented on every send).
+        # Inbound sequence number (last seen from peer; -1 = none yet).
+        # Protected by _send_lock so concurrent sends (main thread + ACK
+        # replies from network_loop) don't race.
+        self.send_seq: int = 0
+        self.recv_seq: int = -1
+        self._send_lock = threading.Lock()
 
 
 def load_or_create_keys(name: str) -> tuple[object, bytes]:
@@ -83,13 +102,17 @@ def load_or_create_keys(name: str) -> tuple[object, bytes]:
 
 
 def send(state: ClientState, msg_type: MessageType, recipient_id: bytes, payload: bytes) -> None:
-    msg = Message.build(
-        message_type=msg_type,
-        sender_id=state.user_id,
-        recipient_id=recipient_id,
-        payload=payload,
-    )
-    state.sock.sendall(msg.to_bytes())
+    with state._send_lock:
+        seq = state.send_seq
+        state.send_seq += 1
+        msg = Message.build(
+            message_type=msg_type,
+            sender_id=state.user_id,
+            recipient_id=recipient_id,
+            payload=payload,
+            sequence_number=seq,
+        )
+        state.sock.sendall(msg.to_bytes())
 
 
 def wait_for(state: ClientState, flag: str, timeout: float = 15.0) -> None:
@@ -114,6 +137,11 @@ def handle(msg: Message, state: ClientState) -> None:
         if state.peer_pubkey is None or state.session_key is None:
             print("\n[warn] chat before session ready, dropping")
             return
+        # Replay protection: sequence number must be strictly increasing.
+        if h.sequence_number <= state.recv_seq:
+            print(f"\n[warn] replay detected (seq {h.sequence_number} <= {state.recv_seq}), dropping")
+            return
+        state.recv_seq = h.sequence_number
         chat = ChatPayload.from_bytes(msg.payload)
         if not _signer.verify(state.peer_pubkey, chat.ciphertext, chat.signature):
             print("\n[warn] signature verification failed, dropping")
@@ -143,6 +171,29 @@ def handle(msg: Message, state: ClientState) -> None:
             state.cond.notify_all()
         return
 
+    # SESSION_ACCEPT involves crypto (ECDH + HKDF) — handle outside the lock
+    # to avoid holding cond while doing CPU work, then take the lock only to
+    # signal completion.
+    if t == MessageType.SESSION_ACCEPT:
+        if state.peer_pubkey is None or state.ephemeral_priv is None:
+            print("\n[warn] unexpected SESSION_ACCEPT, dropping")
+            return
+        accept = SessionAcceptPayload.from_bytes(msg.payload)
+        if not _signer.verify(state.peer_pubkey, accept.ephemeral_pubkey, accept.signature):
+            with state.cond:
+                state.error = "SESSION_ACCEPT signature verification failed"
+                state.got_session_accept = True
+                state.cond.notify_all()
+            return
+        shared_secret = _ecdh.compute_shared_secret(
+            state.ephemeral_priv, accept.ephemeral_pubkey
+        )
+        state.session_key = _ecdh.derive_session_key(shared_secret)
+        with state.cond:
+            state.got_session_accept = True
+            state.cond.notify_all()
+        return
+
     with state.cond:
         if t == MessageType.ACK:
             state.got_ack = True
@@ -158,11 +209,10 @@ def handle(msg: Message, state: ClientState) -> None:
             state.peer_pubkey = CryptoUtils.KeyExchange.public_key_from_bytes(pem)
             state.got_peer_pubkey = True
         elif t == MessageType.SESSION_INIT:
+            # Store the payload so create_room() can verify the signature
+            # after fetching the joiner's long-term public key from the server.
             state.peer_id = h.sender_id
-            enc_key = SessionInitPayload.from_bytes(msg.payload).encrypted_session_key
-            state.session_key = CryptoUtils.KeyExchange.rsa_decrypt_session_key(
-                enc_key, state.priv
-            )
+            state.pending_session_init = SessionInitPayload.from_bytes(msg.payload)
             state.got_session_init = True
         state.cond.notify_all()
 
@@ -237,8 +287,32 @@ def create_room(state: ClientState) -> None:
     print("Share BOTH the code and the id with your peer (out of band).")
     print()
     print("Waiting for peer to connect (up to 10 min)...")
+    # Wait for SESSION_INIT — handler stores the payload and sets peer_id.
     wait_for(state, "got_session_init", timeout=600.0)
+
+    # Fetch joiner's long-term public key so we can verify the SESSION_INIT
+    # signature before proceeding with the ECDH handshake (fixes H2).
     lookup_peer_pubkey(state)
+
+    init_payload = state.pending_session_init
+    if not _signer.verify(
+        state.peer_pubkey, init_payload.ephemeral_pubkey, init_payload.signature
+    ):
+        raise RuntimeError("SESSION_INIT signature verification failed — possible MITM")
+
+    # Generate our own ephemeral keypair, compute ECDH shared secret,
+    # and derive the session key (forward secrecy — fixes C1).
+    creator_eph_priv, creator_eph_pub = _ecdh.generate_keypair()
+    shared_secret = _ecdh.compute_shared_secret(
+        creator_eph_priv, init_payload.ephemeral_pubkey
+    )
+    state.session_key = _ecdh.derive_session_key(shared_secret)
+
+    # Send SESSION_ACCEPT: our ephemeral public key signed with our long-term key.
+    sig = _signer.sign(state.priv, creator_eph_pub)
+    accept = SessionAcceptPayload(ephemeral_pubkey=creator_eph_pub, signature=sig)
+    send(state, MessageType.SESSION_ACCEPT, state.peer_id, accept.to_bytes())
+
     print(f"Session established with {state.peer_id.hex()}")
 
 
@@ -262,18 +336,21 @@ def join_room(state: ClientState) -> None:
     wait_for(state, "got_ack")
     print("Linked.")
 
+    # Fetch creator's long-term public key (needed to verify SESSION_ACCEPT).
     lookup_peer_pubkey(state)
 
-    state.session_key = _sym.generate_aes_key()
-    wrapped = CryptoUtils.KeyExchange.rsa_encrypt_session_key(
-        state.session_key, state.peer_pubkey
-    )
-    send(
-        state,
-        MessageType.SESSION_INIT,
-        state.peer_id,
-        SessionInitPayload(encrypted_session_key=wrapped).to_bytes(),
-    )
+    # Generate an ephemeral X25519 keypair for this session (forward secrecy).
+    state.ephemeral_priv, joiner_eph_pub = _ecdh.generate_keypair()
+
+    # Sign the ephemeral key with our long-term key so the creator can verify
+    # it came from us (fixes H2).
+    sig = _signer.sign(state.priv, joiner_eph_pub)
+    init = SessionInitPayload(ephemeral_pubkey=joiner_eph_pub, signature=sig)
+    send(state, MessageType.SESSION_INIT, state.peer_id, init.to_bytes())
+
+    # Wait for the creator's SESSION_ACCEPT; the handler verifies the
+    # signature and derives the session key via ECDH+HKDF.
+    wait_for(state, "got_session_accept")
     print(f"Session established with {state.peer_id.hex()}")
 
 

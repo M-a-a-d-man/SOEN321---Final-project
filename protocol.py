@@ -7,46 +7,50 @@
 # since you always know exactly how many bytes to read before you know
 # anything else about the message.
 #
-# Header (45 bytes, big-endian):
-#   1 byte  - message type
-#  16 bytes - sender id
-#  16 bytes - recipient id
-#   8 bytes - timestamp (ms)
-#   4 bytes - payload length
 
 from __future__ import annotations
 
+import hashlib
 import struct
 import time
 from dataclasses import dataclass
 from enum import IntEnum
 
 
-HEADER_FORMAT = "!B16s16sQI"
-HEADER_SIZE = struct.calcsize(HEADER_FORMAT)  # 45 bytes
+# Header layout (big-endian):
+#   1 byte  - message type
+#  16 bytes - sender id
+#  16 bytes - recipient id
+#   8 bytes - timestamp (unix ms)
+#   8 bytes - sequence number (per-sender monotonic counter, replay protection)
+#   4 bytes - payload length
+#  32 bytes - SHA-256 of payload (data integrity)
+HEADER_FORMAT = "!B16s16sQQI32s"
+HEADER_SIZE = struct.calcsize(HEADER_FORMAT)  # 85 bytes
 
 
 class MessageType(IntEnum):
-    # client sends its public key so the other side can encrypt the session key
-    KEY_EXCHANGE = 0x01
-    # server sends the session key, encrypted with the recipient's public key
-    SESSION_INIT = 0x02
-    CHAT = 0x03       # actual message, encrypted + signed
-    ACK = 0x04        # let the sender know the message arrived
+    KEY_EXCHANGE = 0x01   # client registers its public key with the server
+    SESSION_INIT = 0x02   # joiner sends ephemeral pub key + signature to creator
+    CHAT = 0x03           # actual message, AES-256-GCM encrypted + RSA-PSS signed
+    ACK = 0x04            # let the sender know the message arrived
     ERROR = 0x05
     DISCONNECT = 0x06
-    JOIN_CREATE = 0x07   # client wants to create a new room
+    JOIN_CREATE = 0x07    # client wants to create a new room
     JOIN_RESPONSE = 0x08  # server replies with the generated join code
-    JOIN_REQUEST = 0x09  # client wants to join an existing room by code
+    JOIN_REQUEST = 0x09   # client wants to join an existing room by code
+    SESSION_ACCEPT = 0x0A # creator replies with its ephemeral pub key + signature
 
 
 @dataclass(frozen=True)
 class Header:
-    message_type:   MessageType
-    sender_id:      bytes  # 16 bytes
-    recipient_id:   bytes  # 16 bytes
-    timestamp:      int    # unix ms
-    payload_length: int
+    message_type:    MessageType
+    sender_id:       bytes  # 16 bytes
+    recipient_id:    bytes  # 16 bytes
+    timestamp:       int    # unix ms
+    sequence_number: int    # per-sender monotonic counter (replay protection)
+    payload_length:  int
+    payload_hash:    bytes  # SHA-256 of payload (data integrity, 32 bytes)
 
     def __post_init__(self) -> None:
         if not isinstance(self.message_type, MessageType):
@@ -65,8 +69,14 @@ class Header:
             )
         if not (0 <= self.timestamp <= 0xFFFFFFFFFFFFFFFF):
             raise ValueError("timestamp out of range for uint64")
+        if not (0 <= self.sequence_number <= 0xFFFFFFFFFFFFFFFF):
+            raise ValueError("sequence_number out of range for uint64")
         if not (0 <= self.payload_length <= 0xFFFFFFFF):
             raise ValueError("payload_length out of range for uint32")
+        if len(self.payload_hash) != 32:
+            raise ValueError(
+                f"payload_hash must be 32 bytes, got {len(self.payload_hash)}"
+            )
 
     def to_bytes(self) -> bytes:
         return struct.pack(
@@ -75,7 +85,9 @@ class Header:
             self.sender_id,
             self.recipient_id,
             self.timestamp,
+            self.sequence_number,
             self.payload_length,
+            self.payload_hash,
         )
 
     @classmethod
@@ -85,15 +97,18 @@ class Header:
                 f"need {HEADER_SIZE} bytes for header, got {len(data)}"
             )
         fields = struct.unpack(HEADER_FORMAT, data[:HEADER_SIZE])
-        msg_type_raw, sender_id, recipient_id, timestamp, payload_length = (
-            fields
-        )
+        (
+            msg_type_raw, sender_id, recipient_id,
+            timestamp, sequence_number, payload_length, payload_hash,
+        ) = fields
         return cls(
             message_type=MessageType(msg_type_raw),
             sender_id=sender_id,
             recipient_id=recipient_id,
             timestamp=timestamp,
+            sequence_number=sequence_number,
             payload_length=payload_length,
+            payload_hash=payload_hash,
         )
 
 
@@ -122,17 +137,22 @@ class Message:
         recipient_id: bytes,
         payload: bytes,
         timestamp: int | None = None,
+        sequence_number: int = 0,
     ) -> Message:
         # default to now so callers don't have to think about it
         ts = timestamp if timestamp is not None else int(time.time() * 1000)
+        payload_bytes = bytes(payload)
+        payload_hash = hashlib.sha256(payload_bytes).digest()
         header = Header(
             message_type=message_type,
             sender_id=sender_id,
             recipient_id=recipient_id,
             timestamp=ts,
-            payload_length=len(payload),
+            sequence_number=sequence_number,
+            payload_length=len(payload_bytes),
+            payload_hash=payload_hash,
         )
-        return cls(header=header, payload=bytes(payload))
+        return cls(header=header, payload=payload_bytes)
 
     def to_bytes(self) -> bytes:
         return self.header.to_bytes() + self.payload
@@ -143,6 +163,11 @@ class Message:
         payload = data[HEADER_SIZE: HEADER_SIZE + header.payload_length]
         if len(payload) != header.payload_length:
             raise ValueError("message was truncated mid-payload")
+        computed_hash = hashlib.sha256(payload).digest()
+        if computed_hash != header.payload_hash:
+            raise ValueError(
+                "payload hash mismatch — data integrity check failed"
+            )
         return cls(header=header, payload=payload)
 
 
@@ -188,26 +213,75 @@ class KeyExchangePayload:
 
 @dataclass(frozen=True)
 class SessionInitPayload:
-    # the AES key is encrypted with the recipient's RSA public key
-    # so only they can read it
-    encrypted_session_key: bytes
+    # Joiner's X25519 ephemeral public key (raw 32 bytes) + RSA-PSS signature
+    # over that key using the joiner's long-term private key.  The creator
+    # verifies the signature before accepting the ECDH handshake.
+    ephemeral_pubkey: bytes  # 32-byte raw X25519 public key
+    signature:        bytes  # RSA-PSS over ephemeral_pubkey
 
     def __post_init__(self) -> None:
-        if not isinstance(self.encrypted_session_key, (bytes, bytearray)):
-            raise TypeError("encrypted_session_key must be bytes")
-        if not self.encrypted_session_key:
-            raise ValueError("encrypted_session_key is empty")
+        if not isinstance(self.ephemeral_pubkey, (bytes, bytearray)):
+            raise TypeError("ephemeral_pubkey must be bytes")
+        if len(self.ephemeral_pubkey) != 32:
+            raise ValueError(
+                f"ephemeral_pubkey must be 32 bytes, got {len(self.ephemeral_pubkey)}"
+            )
+        if not isinstance(self.signature, (bytes, bytearray)):
+            raise TypeError("signature must be bytes")
+        if not self.signature:
+            raise ValueError("signature is empty")
 
     def to_bytes(self) -> bytes:
         return (
-            struct.pack("!I", len(self.encrypted_session_key))
-            + self.encrypted_session_key
+            self.ephemeral_pubkey
+            + struct.pack("!I", len(self.signature))
+            + self.signature
         )
 
     @classmethod
     def from_bytes(cls, data: bytes) -> SessionInitPayload:
-        enc_key, _ = _read_blob(data, 0)
-        return cls(encrypted_session_key=enc_key)
+        if len(data) < 32:
+            raise ValueError("SessionInitPayload too short")
+        ephemeral_pubkey = data[:32]
+        sig, _ = _read_blob(data, 32)
+        return cls(ephemeral_pubkey=bytes(ephemeral_pubkey), signature=sig)
+
+
+@dataclass(frozen=True)
+class SessionAcceptPayload:
+    # Creator's X25519 ephemeral public key (raw 32 bytes) + RSA-PSS signature
+    # over that key using the creator's long-term private key.  The joiner
+    # verifies the signature, then both sides derive the same session key via
+    # HKDF over the ECDH shared secret.
+    ephemeral_pubkey: bytes  # 32-byte raw X25519 public key
+    signature:        bytes  # RSA-PSS over ephemeral_pubkey
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ephemeral_pubkey, (bytes, bytearray)):
+            raise TypeError("ephemeral_pubkey must be bytes")
+        if len(self.ephemeral_pubkey) != 32:
+            raise ValueError(
+                f"ephemeral_pubkey must be 32 bytes, got {len(self.ephemeral_pubkey)}"
+            )
+        if not isinstance(self.signature, (bytes, bytearray)):
+            raise TypeError("signature must be bytes")
+        if not self.signature:
+            raise ValueError("signature is empty")
+
+    def to_bytes(self) -> bytes:
+        return (
+            self.ephemeral_pubkey
+            + struct.pack("!I", len(self.signature))
+            + self.signature
+        )
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> SessionAcceptPayload:
+        if len(data) < 32:
+            raise ValueError("SessionAcceptPayload too short")
+        ephemeral_pubkey = data[:32]
+        sig, _ = _read_blob(data, 32)
+        return cls(ephemeral_pubkey=bytes(ephemeral_pubkey), signature=sig)
 
 
 @dataclass(frozen=True)

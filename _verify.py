@@ -346,6 +346,7 @@ def test_7_malformed_header_guard() -> None:
     banner("TEST 7: Client bails on malformed header")
     # Run client.network_loop against a socketpair and feed garbage.
     import importlib
+    from protocol import HEADER_SIZE as _HEADER_SIZE
     client_mod = importlib.import_module("client")
 
     a, b = socket.socketpair()
@@ -357,8 +358,8 @@ def test_7_malformed_header_guard() -> None:
     t = threading.Thread(target=client_mod.network_loop, args=(state,), daemon=True)
     t.start()
 
-    # Send a 45-byte blob whose first byte is 0xFF (invalid MessageType)
-    garbage = b"\xff" + b"\x00" * (45 - 1)
+    # Send a full-header-sized blob whose first byte is 0xFF (invalid MessageType)
+    garbage = b"\xff" + b"\x00" * (_HEADER_SIZE - 1)
     b.sendall(garbage)
 
     # Give the loop time to process and bail

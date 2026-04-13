@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import socket
 import selectors
+import time
 import types
 import secrets
 import string
@@ -23,13 +24,15 @@ SERVER_ID = b'\x00' * 16
 
 # server state
 # Maps user_id to their public key PEM
-public_keys: dict[bytes, bytes] = {} 
-# Maps user_id to their selector key           
+public_keys: dict[bytes, bytes] = {}
+# Maps user_id to their selector key
 connections: dict[bytes, selectors.SelectorKey] = {}
-# Maps join codes to the user_id that created them  
-join_codes: dict[str, bytes] = {}           
-# Set of frozensets containing pairs of linked user_ids     
-linked_pairs: set[frozenset] = set()           
+# Maps join codes to the user_id that created them
+join_codes: dict[str, bytes] = {}
+# Set of frozensets containing pairs of linked user_ids
+linked_pairs: set[frozenset] = set()
+# Per-sender last seen sequence number (replay protection)
+last_seq: dict[bytes, int] = {}
 
 sel = selectors.DefaultSelector()
 
@@ -71,6 +74,24 @@ def handle_message(key: selectors.SelectorKey, message: Message):
     header = message.header
     sender_id = header.sender_id
     recipient_id = header.recipient_id
+
+    # --- Timestamp validation -------------------------------------------
+    # Reject messages whose timestamp is more than 60 seconds off from
+    # server time to limit the replay window.
+    now_ms = int(time.time() * 1000)
+    if abs(now_ms - header.timestamp) > 60_000:
+        send_error(sender_id, 9, "Timestamp outside acceptable window", key=key)
+        return
+
+    # --- Sequence number replay protection --------------------------------
+    # Every sender must use strictly increasing sequence numbers.  The check
+    # is skipped for the very first message from a sender (no prior record),
+    # but once a sequence number is recorded all subsequent ones must exceed it.
+    last = last_seq.get(sender_id)
+    if last is not None and header.sequence_number <= last:
+        send_error(sender_id, 8, "Replay detected: sequence number not increasing", key=key)
+        return
+    last_seq[sender_id] = header.sequence_number
 
     if header.message_type == MessageType.KEY_EXCHANGE:
         if recipient_id == SERVER_ID:
@@ -146,7 +167,10 @@ def handle_message(key: selectors.SelectorKey, message: Message):
         )
         send_to_client(sender_id, ack)
 
-    elif header.message_type in (MessageType.SESSION_INIT, MessageType.CHAT, MessageType.ACK):
+    elif header.message_type in (
+        MessageType.SESSION_INIT, MessageType.SESSION_ACCEPT,
+        MessageType.CHAT, MessageType.ACK,
+    ):
         # forward to recipient as-is
         if not are_linked(sender_id, recipient_id):
             send_error(sender_id, 3, "Not authorized")
@@ -167,6 +191,7 @@ def handle_message(key: selectors.SelectorKey, message: Message):
 def cleanup_user(user_id: bytes):
     connections.pop(user_id, None)
     public_keys.pop(user_id, None)
+    last_seq.pop(user_id, None)
     codes_to_remove = [code for code, uid in join_codes.items() if uid == user_id]
     for code in codes_to_remove:
         del join_codes[code]

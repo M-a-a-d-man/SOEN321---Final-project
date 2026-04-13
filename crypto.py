@@ -1,10 +1,11 @@
-from fileinput import filename
 import os
 import base64
 from hashlib import sha256
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 
 class CryptoUtils:
@@ -187,3 +188,37 @@ class CryptoUtils:
             digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
             digest.update(data)
             return digest.finalize()
+
+    class EphemeralKeyExchange:
+        """X25519 ephemeral key exchange + HKDF session key derivation.
+
+        Both peers generate a fresh X25519 keypair per session. Each side
+        sends their ephemeral public key (signed with their long-term RSA key)
+        to the other. Both then compute the same ECDH shared secret and derive
+        an identical AES-256 session key via HKDF-SHA-256. Long-term key
+        compromise therefore does not expose past sessions (forward secrecy).
+        """
+
+        @staticmethod
+        def generate_keypair() -> tuple:
+            """Return (X25519PrivateKey, raw_public_key_bytes: bytes)."""
+            priv = X25519PrivateKey.generate()
+            pub_bytes = priv.public_key().public_bytes_raw()
+            return priv, pub_bytes
+
+        @staticmethod
+        def compute_shared_secret(private_key, peer_pub_bytes: bytes) -> bytes:
+            """ECDH: exchange private key with peer's raw 32-byte public key."""
+            peer_pub = X25519PublicKey.from_public_bytes(peer_pub_bytes)
+            return private_key.exchange(peer_pub)
+
+        @staticmethod
+        def derive_session_key(shared_secret: bytes) -> bytes:
+            """Derive a 256-bit AES key from the ECDH shared secret via HKDF-SHA-256."""
+            hkdf = HKDF(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=None,
+                info=b"secure-chat-session-key-v1",
+            )
+            return hkdf.derive(shared_secret)
